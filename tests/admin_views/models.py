@@ -329,7 +329,7 @@ class Subscriber(models.Model):
 
 
 class ExternalSubscriber(Subscriber):
-    pass
+    action = models.CharField(default="subscribe", max_length=80, blank=True)
 
 
 class OldSubscriber(Subscriber):
@@ -390,7 +390,9 @@ class Toy(models.Model):
     child = models.ForeignKey(PKChild, models.CASCADE)
 
 
-class EmptyModel(models.Model):
+class GetQuerySetModel(models.Model):
+    deleted = models.BooleanField(default=False)
+
     def __str__(self):
         return "Primary key = %s" % self.id
 
@@ -958,15 +960,17 @@ class DependentChild(models.Model):
 
 class _Manager(models.Manager):
     def get_queryset(self):
-        return super().get_queryset().filter(pk__gt=1)
+        return super().get_queryset().filter(deleted=False)
 
 
 class FilteredManager(models.Model):
+    deleted = models.BooleanField(default=False)
+
     def __str__(self):
         return "PK=%s" % self.pk
 
-    pk_gt_1 = _Manager()
-    objects = models.Manager()
+    objects = _Manager()  # Default manager uses non-deleted instances only.
+    all_objects = models.Manager()
 
 
 class EmptyModelVisible(models.Model):
@@ -1202,3 +1206,8 @@ class CamelCaseRelatedModel(models.Model):
     fk2 = models.ForeignKey(
         CamelCaseModel, on_delete=models.CASCADE, related_name="fk2"
     )
+
+
+# RemovedInDjango70Warning: When the deprecation ends, remove.
+class ModelAction(models.Model):
+    pass

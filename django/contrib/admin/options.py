@@ -1,8 +1,12 @@
 import copy
 import enum
+import itertools
 import json
 import re
+import sys
 import warnings
+from collections.abc import Callable
+from dataclasses import dataclass
 from functools import partial, update_wrapper
 from urllib.parse import parse_qsl
 from urllib.parse import quote as urlquote
@@ -62,6 +66,7 @@ from django.utils.decorators import method_decorator
 from django.utils.deprecation import RemovedInDjango70Warning, django_file_prefixes
 from django.utils.html import format_html
 from django.utils.http import urlencode
+from django.utils.inspect import get_func_args
 from django.utils.safestring import mark_safe
 from django.utils.text import (
     capfirst,
@@ -86,6 +91,43 @@ class ShowFacets(enum.Enum):
     NEVER = "NEVER"
     ALLOW = "ALLOW"
     ALWAYS = "ALWAYS"
+
+
+class ActionLocation(enum.Enum):
+    CHANGE_FORM = "CHANGE_FORM"
+    CHANGE_LIST = "CHANGE_LIST"
+
+
+@dataclass
+class Action:
+    func: Callable
+    name: str
+    description: str
+    plural_description: str
+    locations: list
+
+    # RemovedInDjango70Warning.
+    def _as_tuple(self):
+        return (self.func, self.name, self.description)
+
+    # RemovedInDjango70Warning.
+    def __iter__(self):
+        warnings.warn(
+            "Unpacking an action tuple is deprecated. Use Action attributes instead.",
+            RemovedInDjango70Warning,
+            skip_file_prefixes=django_file_prefixes(),
+        )
+        return iter(self._as_tuple())
+
+    # RemovedInDjango70Warning.
+    def __getitem__(self, index):
+        warnings.warn(
+            "Using indexes on an action tuple is deprecated. "
+            "Use Action attributes instead.",
+            RemovedInDjango70Warning,
+            skip_file_prefixes=django_file_prefixes(),
+        )
+        return self._as_tuple()[index]
 
 
 HORIZONTAL, VERTICAL = 1, 2
@@ -151,6 +193,7 @@ class BaseModelAdmin(metaclass=forms.MediaDefiningClass):
     view_on_site = True
     show_full_result_count = True
     checks_class = BaseModelAdminChecks
+    delete_confirmation_max_display = None
 
     def check(self, **kwargs):
         return self.checks_class().check(self, **kwargs)
@@ -664,7 +707,6 @@ class ModelAdmin(BaseModelAdmin):
     add_form_template = None
     change_form_template = None
     change_list_template = None
-    delete_confirmation_max_display = None
     delete_confirmation_template = None
     delete_selected_confirmation_template = None
     object_history_template = None
@@ -870,7 +912,13 @@ class ModelAdmin(BaseModelAdmin):
         list_display = self.get_list_display(request)
         list_display_links = self.get_list_display_links(request, list_display)
         # Add the action checkboxes if any actions are available.
-        if self.get_actions(request):
+        # RemovedInDjango70Warning: When the deprecation ends, replace with:
+        # if self.get_actions(
+        #     request, action_location=ActionLocation.CHANGE_LIST
+        # ):
+        if self._get_actions_with_action_location(
+            request, action_location=ActionLocation.CHANGE_LIST
+        ):
             list_display = ["action_checkbox", *list_display]
         sortable_by = self.get_sortable_by(request)
         ChangeList = self.get_changelist(request)
@@ -1030,20 +1078,32 @@ class ModelAdmin(BaseModelAdmin):
         except AttributeError:
             return capfirst(name.replace("_", " "))
 
-    def _get_base_actions(self):
+    def _get_base_actions(self, action_location=ActionLocation.CHANGE_LIST):
         """Return the list of actions, prior to any request-based filtering."""
         actions = []
-        base_actions = (self.get_action(action) for action in self.actions or [])
+        base_actions = (
+            self.get_action(action, action_location) for action in self.actions or []
+        )
         # get_action might have returned None, so filter any of those out.
         base_actions = [action for action in base_actions if action]
-        base_action_names = {name for _, name, _ in base_actions}
+        base_action_names = {action.name for action in base_actions}
 
         # Gather actions from the admin site first
         for name, func in self.admin_site.actions:
             if name in base_action_names:
                 continue
+            locations = getattr(func, "locations", [ActionLocation.CHANGE_LIST])
+            if action_location not in locations:
+                continue
             description = self._get_action_description(func, name)
-            actions.append((func, name, description))
+            action = Action(
+                func=func,
+                name=name,
+                description=description,
+                plural_description=getattr(func, "plural_description", description),
+                locations=locations,
+            )
+            actions.append(action)
         # Add actions from this ModelAdmin.
         actions.extend(base_actions)
         return actions
@@ -1052,7 +1112,7 @@ class ModelAdmin(BaseModelAdmin):
         """Filter out any actions that the user doesn't have access to."""
         filtered_actions = []
         for action in actions:
-            callable = action[0]
+            callable = action.func
             if not hasattr(callable, "allowed_permissions"):
                 filtered_actions.append(action)
                 continue
@@ -1064,7 +1124,27 @@ class ModelAdmin(BaseModelAdmin):
                 filtered_actions.append(action)
         return filtered_actions
 
-    def get_actions(self, request):
+    # RemovedInDjango70Warning: When the deprecation ends, remove.
+    def _get_actions_with_action_location(
+        self, request, action_location=ActionLocation.CHANGE_LIST
+    ):
+        if "action_location" in get_func_args(self.get_actions):
+            return self.get_actions(request, action_location=action_location)
+        else:
+            warnings.warn(
+                "Overriding get_actions() without the 'action_location' parameter is "
+                "deprecated. Update the signature to get_actions(self, request, "
+                "action_location=ActionLocation.CHANGE_LIST).",
+                RemovedInDjango70Warning,
+                skip_file_prefixes=django_file_prefixes(),
+            )
+            if action_location == ActionLocation.CHANGE_FORM:
+                # Disable adding actions on change form when get_actions is
+                # overridden with old signature.
+                return {}
+            return self.get_actions(request)
+
+    def get_actions(self, request, action_location=ActionLocation.CHANGE_LIST):
         """
         Return a dictionary mapping the names of all actions for this
         ModelAdmin to a tuple of (callable, name, description) for each action.
@@ -1073,10 +1153,45 @@ class ModelAdmin(BaseModelAdmin):
         # this page.
         if self.actions is None or IS_POPUP_VAR in request.GET:
             return {}
-        actions = self._filter_actions_by_permissions(request, self._get_base_actions())
-        return {name: (func, name, desc) for func, name, desc in actions}
+        base_actions = self._get_base_actions(action_location=action_location)
+        actions = self._filter_actions_by_permissions(request, base_actions)
+        return {action.name: action for action in actions}
 
-    def get_action_choices(self, request, default_choices=None):
+    # RemovedInDjango70Warning: When the deprecation ends, remove.
+    def _get_action_choices_with_action_location(
+        self,
+        request,
+        default_choices=None,
+        action_location=ActionLocation.CHANGE_LIST,
+    ):
+        if "action_location" in get_func_args(self.get_action_choices):
+            return self.get_action_choices(
+                request,
+                default_choices=default_choices,
+                action_location=action_location,
+            )
+        else:
+            warnings.warn(
+                "Overriding get_action_choices() without the 'action_location' "
+                "parameter is deprecated. Update the signature to "
+                "get_action_choices(self, request, default_choices=None, "
+                "action_location=ActionLocation.CHANGE_LIST).",
+                RemovedInDjango70Warning,
+                skip_file_prefixes=django_file_prefixes(),
+            )
+            return self.get_action_choices(request, default_choices=default_choices)
+
+    def _get_choice_description(self, action, action_location):
+        if action_location == ActionLocation.CHANGE_LIST:
+            return action.plural_description % model_format_dict(self.opts)
+        return action.description % model_format_dict(self.opts)
+
+    def get_action_choices(
+        self,
+        request,
+        default_choices=None,
+        action_location=ActionLocation.CHANGE_LIST,
+    ):
         """
         Return a list of choices for use in a form object. Each choice is a
         tuple (name, description).
@@ -1084,12 +1199,23 @@ class ModelAdmin(BaseModelAdmin):
         if default_choices is None:
             default_choices = [("", get_blank_choice_label())]
         choices = [*default_choices]
-        for func, name, description in self.get_actions(request).values():
-            choice = (name, description % model_format_dict(self.opts))
+        # RemovedInDjango70Warning: When the deprecation ends, replace with:
+        # actions = self.get_actions(request, action_location=action_location)
+        actions = self._get_actions_with_action_location(
+            request, action_location=action_location
+        )
+        for action in actions.values():
+            if isinstance(action, tuple):
+                choice = (action[1], action[2] % model_format_dict(self.opts))
+            else:
+                choice = (
+                    action.name,
+                    self._get_choice_description(action, action_location),
+                )
             choices.append(choice)
         return choices
 
-    def get_action(self, action):
+    def get_action(self, action, action_location=ActionLocation.CHANGE_LIST):
         """
         Return a given action from a parameter, which can either be a callable,
         or the name of a method on the ModelAdmin. Return is a tuple of
@@ -1112,9 +1238,19 @@ class ModelAdmin(BaseModelAdmin):
                 func = self.admin_site.get_action(action)
             except KeyError:
                 return None
+        # Filter out actions based on the action type.
+        locations = getattr(func, "locations", [ActionLocation.CHANGE_LIST])
+        if action_location not in locations:
+            return None
 
         description = self._get_action_description(func, action)
-        return func, action, description
+        return Action(
+            func=func,
+            name=action,
+            description=description,
+            plural_description=getattr(func, "plural_description", description),
+            locations=locations,
+        )
 
     def get_list_display(self, request):
         """
@@ -1667,11 +1803,12 @@ class ModelAdmin(BaseModelAdmin):
         """
         return self._response_post_save(request, obj)
 
-    def response_action(self, request, queryset):
+    def response_action(
+        self, request, queryset, action_location=ActionLocation.CHANGE_LIST
+    ):
         """
-        Handle an admin action. This is called if a request is POSTed to the
-        changelist; it returns an HttpResponse if the action was handled, and
-        None otherwise.
+        Handle an admin action. Returns an HttpResponse if the action was
+        handled, and None otherwise.
         """
 
         # There can be multiple action forms on the page (at the top
@@ -1696,14 +1833,39 @@ class ModelAdmin(BaseModelAdmin):
             # below. So no need to do anything here
             pass
 
-        action_form = self.action_form(data, auto_id=None)
-        action_form.fields["action"].choices = self.get_action_choices(request)
+        prefix = (
+            action_location.value
+            if action_location != ActionLocation.CHANGE_LIST
+            else ""
+        )
+        action_form = self.action_form(data, auto_id=None, prefix=prefix)
+        # RemovedInDjango70Warning: When the deprecation ends, replace with:
+        # action_form.fields["action"].choices = self.get_action_choices(
+        #     request, action_location=action_location
+        # )
+        action_form.fields["action"].choices = (
+            self._get_action_choices_with_action_location(
+                request, action_location=action_location
+            )
+        )
 
         # If the form's valid we can handle the action.
         if action_form.is_valid():
             action = action_form.cleaned_data["action"]
             select_across = action_form.cleaned_data["select_across"]
-            func = self.get_actions(request)[action][0]
+            if action_location == ActionLocation.CHANGE_FORM:
+                select_across = False
+            # RemovedInDjango70Warning: When the deprecation ends, replace:
+            # actions = self.get_actions(
+            #     request, action_location=action_location
+            # )
+            actions = self._get_actions_with_action_location(
+                request, action_location=action_location
+            )
+            if isinstance(actions[action], tuple):
+                func = actions[action][0]
+            else:
+                func = actions[action].func
 
             # Get the list of selected PKs. If nothing's selected, we can't
             # perform an action on it, so bail. Except we want to perform
@@ -1900,24 +2062,59 @@ class ModelAdmin(BaseModelAdmin):
 
         else:
             obj = self.get_object(request, unquote(object_id), to_field)
-
-            if request.method == "POST":
-                if not self.has_change_permission(request, obj):
-                    raise PermissionDenied
-            else:
-                if not self.has_view_or_change_permission(request, obj):
-                    raise PermissionDenied
+            if not self.has_view_or_change_permission(request, obj):
+                raise PermissionDenied
 
             if obj is None:
                 return self._get_obj_does_not_exist_redirect(
                     request, self.opts, object_id
                 )
 
+        action_form = None
+        # RemovedInDjango70Warning: When the deprecation ends, replace with:
+        # actions = self.get_actions(
+        #     request, action_location=ActionLocation.CHANGE_FORM
+        # )
+        actions = self._get_actions_with_action_location(
+            request, action_location=ActionLocation.CHANGE_FORM
+        )
+        if actions and not add:
+            action_location = ActionLocation.CHANGE_FORM
+            action_form = self.action_form(auto_id=None, prefix=action_location.value)
+            # RemovedInDjango70Warning: When the deprecation ends, replace:
+            # action_form.fields["action"].choices = self.get_action_choices(
+            #     request, action_location=action_location
+            # )
+            action_form.fields["action"].choices = (
+                self._get_action_choices_with_action_location(
+                    request, action_location=action_location
+                )
+            )
         fieldsets = self.get_fieldsets(request, obj)
         ModelForm = self.get_form(
             request, obj, change=not add, fields=flatten_fieldsets(fieldsets)
         )
         if request.method == "POST":
+            if (
+                action_form
+                and action_form["action"].html_name in request.POST
+                and "_save" not in request.POST
+                and "_continue" not in request.POST
+                and "_addanother" not in request.POST
+            ):
+                selected = request.POST.getlist(helpers.ACTION_CHECKBOX_NAME)
+                if len(selected) != 1 or selected[0] != str(obj.pk):
+                    raise BadRequest
+                queryset = self.get_queryset(request)
+                if response := self.response_action(
+                    request, queryset, action_location=ActionLocation.CHANGE_FORM
+                ):
+                    return response
+                return HttpResponseRedirect(request.get_full_path())
+
+            if not add and not self.has_change_permission(request, obj):
+                raise PermissionDenied
+
             form = ModelForm(request.POST, request.FILES, instance=obj)
             formsets, inline_instances = self._create_formsets(
                 request,
@@ -1979,6 +2176,8 @@ class ModelAdmin(BaseModelAdmin):
         )
         for inline_formset in inline_formsets:
             media += inline_formset.media
+        if action_form:
+            media += action_form.media
 
         if add:
             title = _("Add %s")
@@ -1999,6 +2198,8 @@ class ModelAdmin(BaseModelAdmin):
             "source_model": request.GET.get(SOURCE_MODEL_VAR),
             "to_field": to_field,
             "media": media,
+            "action_form": action_form,
+            "action_checkbox_name": helpers.ACTION_CHECKBOX_NAME,
             "inline_admin_formsets": inline_formsets,
             "errors": helpers.AdminErrorList(form, formsets),
             "preserved_filters": self.get_preserved_filters(request),
@@ -2131,7 +2332,13 @@ class ModelAdmin(BaseModelAdmin):
         action_failed = False
         selected = request.POST.getlist(helpers.ACTION_CHECKBOX_NAME)
 
-        actions = self.get_actions(request)
+        # RemovedInDjango70Warning: When the deprecation ends, replace with:
+        # actions = self.get_actions(
+        #     request, action_location=ActionLocation.CHANGE_LIST
+        # )
+        actions = self._get_actions_with_action_location(
+            request, action_location=ActionLocation.CHANGE_LIST
+        )
         # Actions with no confirmation
         if (
             actions
@@ -2141,7 +2348,9 @@ class ModelAdmin(BaseModelAdmin):
         ):
             if selected:
                 response = self.response_action(
-                    request, queryset=cl.get_queryset(request)
+                    request,
+                    queryset=cl.get_queryset(request),
+                    action_location=ActionLocation.CHANGE_LIST,
                 )
                 if response:
                     return response
@@ -2165,7 +2374,9 @@ class ModelAdmin(BaseModelAdmin):
         ):
             if selected:
                 response = self.response_action(
-                    request, queryset=cl.get_queryset(request)
+                    request,
+                    queryset=cl.get_queryset(request),
+                    action_location=ActionLocation.CHANGE_LIST,
                 )
                 if response:
                     return response
@@ -2209,7 +2420,15 @@ class ModelAdmin(BaseModelAdmin):
         # Build the action form and populate it with available actions.
         if actions:
             action_form = self.action_form(auto_id=None)
-            action_form.fields["action"].choices = self.get_action_choices(request)
+            # RemovedInDjango70Warning: When the deprecation ends, replace:
+            # action_form.fields["action"].choices = self.get_action_choices(
+            #     request, action_location=ActionLocation.CHANGE_LIST
+            # )
+            action_form.fields["action"].choices = (
+                self._get_action_choices_with_action_location(
+                    request, action_location=ActionLocation.CHANGE_LIST
+                )
+            )
             media += action_form.media
         else:
             action_form = None
@@ -2538,6 +2757,11 @@ class InlineModelAdmin(BaseModelAdmin):
         base_model_form = defaults["form"]
         can_change = self.has_change_permission(request, obj) if request else True
         can_add = self.has_add_permission(request, obj) if request else True
+        delete_confirmation_max_display = (
+            self.delete_confirmation_max_display
+            if self.delete_confirmation_max_display
+            else sys.maxsize
+        )
 
         class DeleteProtectedModelForm(base_model_form):
             def hand_clean_DELETE(self):
@@ -2554,7 +2778,10 @@ class InlineModelAdmin(BaseModelAdmin):
                     collector.collect([self.instance])
                     if collector.protected:
                         objs = []
-                        for p in collector.protected:
+                        protected = itertools.islice(
+                            collector.protected, delete_confirmation_max_display
+                        )
+                        for p in protected:
                             objs.append(
                                 # Translators: Model verbose name and instance
                                 # representation, suitable to be an item in a
@@ -2565,8 +2792,26 @@ class InlineModelAdmin(BaseModelAdmin):
                         params = {
                             "class_name": self._meta.model._meta.verbose_name,
                             "instance": self.instance,
-                            "related_objects": get_text_list(objs, _("and")),
                         }
+                        remaining_object_count = (
+                            len(collector.protected) - delete_confirmation_max_display
+                        )
+                        if remaining_object_count > 0:
+                            # Translators: This string is used as a separator
+                            # between list elements
+                            related = (
+                                _(", ").join(str(i) for i in objs)
+                                + _(", ")
+                                + ngettext(
+                                    "…and %(count)d more object.",
+                                    "…and %(count)d more objects.",
+                                    remaining_object_count,
+                                )
+                                % {"count": remaining_object_count}
+                            )
+                        else:
+                            related = get_text_list(objs, _("and"))
+                        params["related_objects"] = related
                         msg = _(
                             "Deleting %(class_name)s %(instance)s would require "
                             "deleting the following protected related objects: "
